@@ -1,2 +1,2 @@
-# ssec
-Client for Server-Sent Events (SSE)
+# SSEC - Client for Server-Sent Events (SSE)
+Yet another client library for server-sent events (sse).
