@@ -18,6 +18,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type='text/markdown',
     url='https://github.com/jbaudisch/ssec',
+    license='MIT',
     project_urls={
         'Bug Tracker': 'https://github.com/jbaudisch/ssec/issues',
     },
@@ -32,5 +33,6 @@ setuptools.setup(
         'Topic :: System :: Networking'
     ],
     packages=['ssec'],
+    install_requires=['requests'],
     python_requires='>=3.10',
 )
