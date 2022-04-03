@@ -270,7 +270,7 @@ class EventSource:
         callback : Callable[[Event], None]
             The listener itself.
         """
-        self._listeners[event_type].append(callable)
+        self._listeners[event_type].append(callback)
 
     def open(self) -> None:
         """Opens the event source stream."""
