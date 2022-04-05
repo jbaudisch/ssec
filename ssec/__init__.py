@@ -33,6 +33,7 @@ import urllib3
 from ssec.utilities import is_valid_url
 
 _logger = logging.getLogger(__name__)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 @dataclasses.dataclass(frozen=True)
@@ -97,6 +98,10 @@ class EventSource:
         self._last_event_id = ''
 
         self._listeners: Dict[str, List[Callable[[Event], None]]] = collections.defaultdict(list)
+        _logger.debug(f'{self} - Initialized')
+
+    def __str__(self) -> str:
+        return f'{self.__class__.__name__}(url={self._url}, state={self._state})'
 
     @property
     def url(self) -> str:
@@ -138,6 +143,7 @@ class EventSource:
             self.__fail(f'Invalid response: status_code={self._response.status_code}, mime-type={self._response.headers["Content-Type"]}')
             return False
 
+        _logger.debug(f'{self} - Connected')
         return True
 
     def __dispatch(self, type: str, data: str = '') -> None:
@@ -151,6 +157,7 @@ class EventSource:
             The event data.
         """
         if self._state is self.State.CLOSED:
+            _logger.debug(f'{self} - Could not dispatch event => Connection closed')
             return
 
         if not type:
@@ -160,6 +167,8 @@ class EventSource:
         data = data.rstrip('\n')
 
         event = Event(type, data)
+        _logger.debug(f'{self} - Dispatching event: {event}')
+
         match event.type:
             case 'open':
                 self.on_open(event)
@@ -180,11 +189,13 @@ class EventSource:
             Explanation of the failure.
         """
         if self._state is not self.State.CLOSED:
+            _logger.debug(f'{self} - Connection failed: {reason}')
             self.__dispatch('error', reason)
             self._state = self.State.CLOSED
 
     def __listen(self) -> None:
         """Listens for incoming events."""
+        _logger.debug(f'{self} - Listening for new events')
         while self._state is self.State.OPEN:
             event_type = ''
             event_data = ''
@@ -235,6 +246,7 @@ class EventSource:
         if self._state is self.State.CLOSED:
             return
         
+        _logger.debug(f'{self} - Reestablishing connection')
         self._state = self.State.CONNECTING
         self.__dispatch('error', 'reestablish')
 
@@ -271,9 +283,11 @@ class EventSource:
             The listener itself.
         """
         self._listeners[event_type].append(callback)
+        _logger.debug(f'{self} - Added new event listener: {callback}')
 
     def open(self) -> None:
         """Opens the event source stream."""
+        _logger.debug(f'{self} - Opening connection')
         if not self.__connect():
             self.__reestablish()
 
@@ -282,6 +296,7 @@ class EventSource:
 
     def close(self) -> None:
         """Closes the event source stream."""
+        _logger.debug(f'{self} - Closing connection')
         self._state = self.State.CLOSED
         if self._response:
             self._response.close()
