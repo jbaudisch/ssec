@@ -3,8 +3,8 @@ This package provides a modern client for server-sent events (sse).
 
 The code is based on the standard specification[1] and was adapted for python.
 Althought there are serveral other implementations like [2] and [3], the goal
-of this package is to have a modern (2022), well documented and feature-rich
-client.
+of this package is to have a modern (2022), thread-safe, well documented and
+feature-rich client.
 
 [1]: https://html.spec.whatwg.org/multipage/server-sent-events.html
 [2]: https://github.com/btubbs/sseclient
@@ -23,6 +23,7 @@ import collections
 import dataclasses
 import enum
 import logging
+import threading
 import time
 
 # Library Imports
@@ -93,15 +94,18 @@ class EventSource:
 
         self._requester = session or requests
         self._response = None
+        self._response_iterator = None
+        self._response_lock = threading.Lock()
 
         self._state = self.State.CONNECTING
+        self._state_lock = threading.Lock()
         self._last_event_id = ''
 
         self._listeners: Dict[str, List[Callable[[Event], None]]] = collections.defaultdict(list)
         _logger.debug(f'{self} - Initialized')
 
     def __str__(self) -> str:
-        return f'{self.__class__.__name__}(url={self._url}, state={self._state})'
+        return f'{self.__class__.__name__}(url={self._url}, state={self.state})'
 
     @property
     def url(self) -> str:
@@ -109,12 +113,14 @@ class EventSource:
 
     @property
     def state(self) -> State:
-        return self._state
+        with self._state_lock:
+            return self._state
 
     def __announce(self) -> None:
         """Announces the connection."""
-        if self._state is not self.State.CLOSED:
-            self._state = self.State.OPEN
+        if self.state is not self.State.CLOSED:
+            with self._state_lock:
+                self._state = self.State.OPEN
             self.__dispatch('open')
 
     def __connect(self) -> bool:
@@ -125,8 +131,10 @@ class EventSource:
         True, if successfully connected, False, otherwise.
         """
         try:
-            self._response = self._requester.get(self._url, stream=True, **self._requests_kwargs)
-            self._response.raise_for_status()
+            with self._response_lock:
+                self._response = self._requester.get(self._url, stream=True, **self._requests_kwargs)
+                self._response.raise_for_status()
+                self._response_iterator = self._response.iter_lines()
         except requests.ConnectionError as e:
             self.__fail(str(e))
             return False
@@ -156,7 +164,7 @@ class EventSource:
         data : str
             The event data.
         """
-        if self._state is self.State.CLOSED:
+        if self.state is self.State.CLOSED:
             _logger.debug(f'{self} - Could not dispatch event => Connection closed')
             return
 
@@ -188,66 +196,71 @@ class EventSource:
         reason : str
             Explanation of the failure.
         """
-        if self._state is not self.State.CLOSED:
+        if self.state is not self.State.CLOSED:
             _logger.debug(f'{self} - Connection failed: {reason}')
             self.__dispatch('error', reason)
-            self._state = self.State.CLOSED
+            with self._state_lock:
+                self._state = self.State.CLOSED
 
     def __listen(self) -> None:
         """Listens for incoming events."""
         _logger.debug(f'{self} - Listening for new events')
-        while self._state is self.State.OPEN:
-            event_type = ''
-            event_data = ''
+
+        event_type = ''
+        event_data = ''
+        while self.state is self.State.OPEN:
             try:
-                for line in self._response.iter_lines():
-                    # If the line is empty (a blank line) -> Dispatch the event.
-                    if not line:
-                        self.__dispatch(event_type, event_data)
-                        event_type, event_data = '', ''
-                        continue
-
-                    line = (line.decode('utf8')).strip()
-                    # If the line starts with a U+003A COLON character (:) -> Ignore the line.
-                    if line.startswith(self.DELIMITER):
-                        continue
-
-                    name, _, value = line.partition(self.DELIMITER)
-
-                    # Space after the colon is ignored if present.
-                    if value.startswith(' '):
-                        value = value[1:]
-
-                    match name:
-                        case 'event':
-                            # If the field name is "event" -> Set the event type buffer to field value.
-                            event_type = value
-                        case 'data':
-                            # If the field name is "data" -> Append the field value to the data buffer, then append a single U+000A LINE FEED (LF) character to the data buffer.
-                            event_data += f'{value}\n'
-                        case 'id':
-                            # If the field name is "id" -> If the field value does not contain U+0000 NULL, then set the last event ID buffer to the field value. Otherwise, ignore the field.
-                            # The specification is not clear here. In an example it says: "If the "id" field has no value, this will reset the last event ID to the empty string"
-                            self._last_event_id = value
-                        case 'retry':
-                            # If the field name is "retry" -> If the field value consists of only ASCII digits, then interpret the field value as an integer in base ten, and set the event stream's reconnection time to that integer. Otherwise, ignore the field.
-                            if value.isdigit():
-                                self._reconnection_time = int(value)
-                        case _:
-                            # Otherwise -> The field is ignored.
-                            continue
+                with self._response_lock:
+                    line = next(self._response_iterator)
             except requests.exceptions.RequestException:
                 self.__reestablish()
             except AttributeError:
-                return
+                break
+
+            # If the line is empty (a blank line) -> Dispatch the event.
+            if not line:
+                self.__dispatch(event_type, event_data)
+                event_type, event_data = '', ''
+                continue
+
+            line = (line.decode('utf8')).strip()
+            # If the line starts with a U+003A COLON character (:) -> Ignore the line.
+            if line.startswith(self.DELIMITER):
+                continue
+
+            name, _, value = line.partition(self.DELIMITER)
+
+            # Space after the colon is ignored if present.
+            if value.startswith(' '):
+                value = value[1:]
+
+            match name:
+                case 'event':
+                    # If the field name is "event" -> Set the event type buffer to field value.
+                    event_type = value
+                case 'data':
+                    # If the field name is "data" -> Append the field value to the data buffer, then append a single U+000A LINE FEED (LF) character to the data buffer.
+                    event_data += f'{value}\n'
+                case 'id':
+                    # If the field name is "id" -> If the field value does not contain U+0000 NULL, then set the last event ID buffer to the field value. Otherwise, ignore the field.
+                    # The specification is not clear here. In an example it says: "If the "id" field has no value, this will reset the last event ID to the empty string"
+                    self._last_event_id = value
+                case 'retry':
+                    # If the field name is "retry" -> If the field value consists of only ASCII digits, then interpret the field value as an integer in base ten, and set the event stream's reconnection time to that integer. Otherwise, ignore the field.
+                    if value.isdigit():
+                        self._reconnection_time = int(value)
+                case _:
+                    # Otherwise -> The field is ignored.
+                    continue
 
     def __reestablish(self) -> None:
         """Reestablishes the connection."""
-        if self._state is self.State.CLOSED:
+        if self.state is self.State.CLOSED:
             return
         
         _logger.debug(f'{self} - Reestablishing connection')
-        self._state = self.State.CONNECTING
+        with self._state_lock:
+            self._state = self.State.CONNECTING
         self.__dispatch('error', 'reestablish')
 
         if self._last_event_id:
@@ -255,7 +268,7 @@ class EventSource:
 
         attempt = 0
         while True:
-            if self._state is not self.State.CONNECTING:
+            if self.state is not self.State.CONNECTING:
                 break
 
             # Wait a delay equal to the reconnection time of the event source.
@@ -297,9 +310,11 @@ class EventSource:
     def close(self) -> None:
         """Closes the event source stream."""
         _logger.debug(f'{self} - Closing connection')
-        self._state = self.State.CLOSED
+        with self._state_lock:
+            self._state = self.State.CLOSED
         if self._response:
-            self._response.close()
+            with self._response_lock:
+                self._response.close()
 
     # # # # # # # # # #
     # Event Methods
