@@ -214,6 +214,7 @@ class EventSource:
                     line = next(self._response_iterator)
             except requests.exceptions.RequestException:
                 self.__reestablish()
+                continue
             except AttributeError:
                 break
 
