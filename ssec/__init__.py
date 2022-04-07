@@ -42,6 +42,8 @@ from ssec.utilities import is_valid_url
 _logger = logging.getLogger(__name__)
 logging.getLogger('urllib3').setLevel(logging.ERROR)
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 @dataclasses.dataclass(frozen=True)
 class Event:
