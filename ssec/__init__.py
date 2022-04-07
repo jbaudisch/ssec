@@ -115,8 +115,8 @@ class EventSource:
         # Process a queue with an instance of UTF-8’s decoder [...] "replacement".
         self._decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
 
-        self._rlock = threading.RLock()
-        self._slock = threading.RLock()
+        self._response_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._interrupt = threading.Event()
 
     def __str__(self) -> str:
@@ -128,14 +128,14 @@ class EventSource:
 
     @property
     def state(self) -> State:
-        with self._slock:
+        with self._state_lock:
             return self._state
 
     def __announce(self) -> None:
         if self.state is not self.State.CONNECTING:
             return
 
-        with self._slock:
+        with self._state_lock:
             self._state = self.State.OPEN
 
         self.__dispatch('open')
@@ -145,7 +145,7 @@ class EventSource:
             return
 
         try:
-            with self._rlock:
+            with self._response_lock:
                 self._response = self._request.get(self._url, stream=True, **self._request_kwargs)
                 self._response.raise_for_status()
         except requests.RequestException as e:
@@ -201,7 +201,7 @@ class EventSource:
         def generate() -> Generator[str]:
             while self.state is self.State.OPEN:
                 try:
-                    with self._rlock:
+                    with self._response_lock:
                         chunk = self._response.raw.read(self._chunk_size)
                 except urllib3.exceptions.HTTPError as e:
                     _logger.debug(f'{self} - Failed reading content from response!')
@@ -289,7 +289,7 @@ class EventSource:
             return
 
         self.__dispatch('error')
-        with self._slock:
+        with self._state_lock:
             self._state = self.State.CONNECTING
 
         if self._last_event_id:
@@ -339,7 +339,7 @@ class EventSource:
         if self.state is self.State.CLOSED:
             return
 
-        with self._slock:
+        with self._state_lock:
             self._state = self.State.CLOSED
 
         self._interrupt.set()
@@ -347,7 +347,7 @@ class EventSource:
         if not self._response:
             return
 
-        with self._rlock:
+        with self._response_lock:
             self._response.close()
 
         _logger.debug(f'{self} - Closed!')
