@@ -8,8 +8,10 @@ if TYPE_CHECKING:
     from ssec import Event
 
 # Builtin Imports
+import logging
 import threading
 import time
+import sys
 
 # Library Imports
 # []
@@ -17,30 +19,23 @@ import time
 # Project Imports
 from ssec import EventSource
 
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
-def on_open(event: Event) -> None:
-    print(event)
-
-def on_message(event: Event) -> None:
-    print(event)
-
-def on_error(event: Event) -> None:
-    print(event)
 
 # # # # # # # # # #
 # Normal Example
-
+event_source = EventSource('https://stream.wikimedia.org/v2/stream/recentchange')
+event_source.on_open = print
+event_source.on_message = print
+event_source.on_error = print
+event_source.open()  # Interrupt with CTRL+C
 
 # # # # # # # # # #
 # Thread Example
-token = 'oh.sharly.mwRaGJ3uKx2IAc3m1z8j88FjDSQ0WCNI6MswMWp6YWmB0iYbfpYKwnDzEFqqaaWYKX2qdrYStfuAcGP40X3hQ'
-headers = {
-    'Authorization': f'Bearer {token}'
-}
-event_source = EventSource('https://openhabian:8443/rest/events', timeout=5, headers=headers, verify=False)
-event_source.on_open = on_error
-event_source.on_message = on_message
-event_source.on_error = on_error
+event_source = EventSource('https://stream.wikimedia.org/v2/stream/recentchange', timeout=5)
+event_source.on_open = print
+event_source.on_message = print
+event_source.on_error = print
 t = threading.Thread(target=event_source.open)
 t.start()
 try:

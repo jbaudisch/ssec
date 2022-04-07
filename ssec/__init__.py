@@ -9,6 +9,11 @@ feature-rich client.
 [1]: https://html.spec.whatwg.org/multipage/server-sent-events.html
 [2]: https://github.com/btubbs/sseclient
 [3]: https://github.com/mpetazzoni/sseclient
+
+NotImplemented:
+    - Event stream requests can be redirected using HTTP 301 and 307 redirects as with normal HTTP requests
+    - A client can be told to stop reconnecting using the HTTP 204 No Content response code.
+    - withCredentials
 """
 # Future Imports
 from __future__ import annotations
@@ -19,12 +24,13 @@ if TYPE_CHECKING:
     from typing import *
 
 # Builtin Imports
+import cgi
+import codecs
 import collections
 import dataclasses
 import enum
 import logging
 import threading
-import time
 
 # Library Imports
 import requests
@@ -35,18 +41,19 @@ from ssec.utilities import is_valid_url
 
 _logger = logging.getLogger(__name__)
 logging.getLogger('urllib3').setLevel(logging.ERROR)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 @dataclasses.dataclass(frozen=True)
 class Event:
-    type: str
-    data: str
+    type: str = ''
+    data: str = ''
+    id: str = ''
 
 
 class EventSource:
 
     class State(enum.Enum):
-        """Represents the state of the connection."""
+        """Enum representing the state of the EventSource connection."""
         CONNECTING = enum.auto()
         OPEN = enum.auto()
         CLOSED = enum.auto()
@@ -54,7 +61,8 @@ class EventSource:
     MIME_TYPE = 'text/event-stream'
     DELIMITER = ':'
 
-    def __init__(self, url: str, reconnection_time: int = 1000, backoff_delay: int = 5000, session: Optional[requests.Session] = None, **requests_kwargs: Dict[str, Any]):
+    def __init__(self, url: str, reconnection_time: int = 3000, backoff_delay: int = 3000, chunk_size: int = 1,
+                 session: Optional[requests.Session] = None, **request_kwargs: Dict[str, Any]) -> None:
         """
         Parameters
         ----------
@@ -63,19 +71,15 @@ class EventSource:
         reconnection_time : int
             The time after which a reconnection being attempted on a connection lost, in milliseconds.
         backoff_delay : int
-            An exponential backoff delay to avoid overloading a potentially already overloaded server (powered by reconnect-attempts), in milliseconds.
+            An exponential backoff delay to avoid overloading a potentially already
+            overloaded server (powered by reconnect-attempts), in milliseconds.
+        chunk_size : int
+            Size of the chunks read by the underlying response object.
         session : Optional[requests.Session]
             Optionally, an already existing session object.
         requests_kwargs : Dict[str, Any]    
             Additional arguments for the underlying request like headers, verify etc.
             The stream argument is always set to True and will be ignored if set by user.
-
-        Notes
-        -----
-        In case the event stream is discontinuous, the algorithm will block until a new
-        event arrives. There is no way to interact with the object in the blocking state.
-        Program shutdowns and other checks are not possible at that time. To prevent this,
-        setting a timeout value to the requests_kwargs is the right choice.
         """
         if not is_valid_url(url):
             raise SyntaxError(f'The URL string "{url}" did not match the expected pattern.')
@@ -83,26 +87,29 @@ class EventSource:
         self._url = url
         self._reconnection_time = reconnection_time
         self._backoff_delay = backoff_delay
-        self._requests_kwargs = requests_kwargs
-
-        # Ensure mandatory headers are set correctly
-        if 'headers' not in self._requests_kwargs:
-            self._requests_kwargs['headers'] = {}
-
-        self._requests_kwargs['headers']['Accept'] = self.MIME_TYPE
-        self._requests_kwargs['headers']['Cache-Control'] = 'no-store'
-
-        self._requester = session or requests
-        self._response = None
-        self._response_iterator = None
-        self._response_lock = threading.Lock()
-
-        self._state = self.State.CONNECTING
-        self._state_lock = threading.Lock()
+        self._chunk_size = chunk_size
         self._last_event_id = ''
+        self._request = session or requests
+        self._state = self.State.CONNECTING
+        self._request_kwargs = request_kwargs
+    
+        # Ensure mandatory headers are set correctly.
+        if 'headers' not in self._request_kwargs:
+            self._request_kwargs['headers'] = {}
+
+        self._request_kwargs['headers']['Accept'] = self.MIME_TYPE
+        self._request_kwargs['headers']['Cache-Control'] = 'no-store'
 
         self._listeners: Dict[str, List[Callable[[Event], None]]] = collections.defaultdict(list)
-        _logger.debug(f'{self} - Initialized')
+        self._response: Optional[requests.Response] = None
+        
+        # Event streams are always decoded as UTF-8. There is no way to specify another character encoding.
+        # Process a queue with an instance of UTF-8’s decoder [...] "replacement".
+        self._decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+
+        self._rlock = threading.RLock()
+        self._slock = threading.RLock()
+        self._interrupt = threading.Event()
 
     def __str__(self) -> str:
         return f'{self.__class__.__name__}(url={self._url}, state={self.state})'
@@ -113,61 +120,47 @@ class EventSource:
 
     @property
     def state(self) -> State:
-        with self._state_lock:
+        with self._slock:
             return self._state
 
     def __announce(self) -> None:
-        """Announces the connection."""
-        if self.state is not self.State.CLOSED:
-            with self._state_lock:
-                self._state = self.State.OPEN
-            self.__dispatch('open')
-
-    def __connect(self) -> bool:
-        """Tries to connect to the event stream.
-        
-        Returns
-        -------
-        True, if successfully connected, False, otherwise.
-        """
-        try:
-            with self._response_lock:
-                self._response = self._requester.get(self._url, stream=True, **self._requests_kwargs)
-                self._response.raise_for_status()
-                self._response_iterator = self._response.iter_lines()
-        except requests.ConnectionError as e:
-            self.__fail(str(e))
-            return False
-        except requests.Timeout:
-            return False
-        except requests.HTTPError as e:
-            self.__fail(str(e))
-            return False
-        except requests.TooManyRedirects as e:
-            self.__fail(str(e))
-            return False
-
-        if (self._response.status_code != 200) or (self.MIME_TYPE not in self._response.headers['Content-Type']):
-            self.__fail(f'Invalid response: status_code={self._response.status_code}, mime-type={self._response.headers["Content-Type"]}')
-            return False
-
-        _logger.debug(f'{self} - Connected')
-        return True
-
-    def __dispatch(self, type: str, data: str = '') -> None:
-        """Dispatches an event.
-        
-        Parameters
-        ----------
-        type : str
-            The event type.
-        data : str
-            The event data.
-        """
-        if self.state is self.State.CLOSED:
-            _logger.debug(f'{self} - Could not dispatch event => Connection closed')
+        if self.state is not self.State.CONNECTING:
             return
 
+        with self._slock:
+            self._state = self.State.OPEN
+
+        self.__dispatch('open')
+
+    def __connect(self) -> None:
+        if self.state is not self.State.CONNECTING:
+            return
+
+        try:
+            with self._rlock:
+                self._response = self._request.get(self._url, stream=True, **self._request_kwargs)
+                self._response.raise_for_status()
+        except requests.RequestException as e:
+            _logger.error(e)
+            self.__fail()
+            return
+
+        mime_type, _ = cgi.parse_header(self._response.headers['Content-Type'])
+        if mime_type != self.MIME_TYPE:
+            msg = f'Source responded with an invalid content type "{mime_type}", should have been "{self.MIME_TYPE}"!'
+            _logger.error(msg)
+            self.__fail()
+            return
+
+        if self._response.status_code != 200:
+            msg = f'Source responded with an invalid status code "{self._response.status_code}", should have been "200"!'
+            _logger.error(msg)
+            self.__fail()
+            return
+
+        self.__announce()
+
+    def __dispatch(self, type: str, data: str = '') -> None:
         if not type:
             type = 'message'
 
@@ -188,43 +181,67 @@ class EventSource:
         for callback in self._listeners[event.type]:
             callback(event)
 
-    def __fail(self, reason: str) -> None:
-        """Fail the connection.
-        
-        Parameters
-        ----------
-        reason : str
-            Explanation of the failure.
-        """
-        if self.state is not self.State.CLOSED:
-            _logger.debug(f'{self} - Connection failed: {reason}')
-            self.__dispatch('error', reason)
-            with self._state_lock:
-                self._state = self.State.CLOSED
+    def __fail(self) -> None:
+        if self.state is self.State.CLOSED:
+            return
+
+        _logger.error(f'{self} - Connection failed due to a previous error!')
+        self.close()
+        self.__dispatch('error')
+
+    def __iter_content(self) -> Generator[str]:
+        def generate() -> Generator[str]:
+            while self.state is self.State.OPEN:
+                try:
+                    with self._rlock:
+                        chunk = self._response.raw.read(self._chunk_size)
+                except urllib3.exceptions.HTTPError as e:
+                    _logger.debug(f'{self} - Failed reading content from response!')
+                    _logger.debug(f'{self} - Reason: "{e}"!')
+                    self.__reconnect()
+                    continue
+                except KeyboardInterrupt:
+                    _logger.error(f'{self} - KeyboardInterrupt through user!')
+                    self.__fail()
+                    return
+
+                if not chunk:
+                    break
+                yield chunk
+
+        yield from generate()
+
+    def __iter_lines(self) -> Generator[str]:
+        # While testing a previous version of this library, which included
+        # an approach using the response.iter_lines()/content() method from the
+        # request module, it turned out that it was missing some content of some
+        # sse messages. It seems like the chunked header is responsible for that.
+        # To bypass this behaviour, we'll use the raw response here.
+        buffer = ''
+        for chunk in self.__iter_content():
+            buffer += self._decoder.decode(chunk)
+            lines = buffer.splitlines(keepends=True)
+            buffer = ''
+            for line in lines:
+                if line.endswith(('\r\n', '\n', '\r')):
+                    # Using '\r\n' as the parameter to rstrip means that it will strip out any trailing combination of '\r' or '\n'.
+                    yield line.rstrip('\r\n')
+                else:
+                    buffer += line
 
     def __listen(self) -> None:
-        """Listens for incoming events."""
-        _logger.debug(f'{self} - Listening for new events')
+        if self.state is not self._state.OPEN:
+            return
 
         event_type = ''
         event_data = ''
-        while self.state is self.State.OPEN:
-            try:
-                with self._response_lock:
-                    line = next(self._response_iterator)
-            except requests.exceptions.RequestException:
-                self.__reestablish()
-                continue
-            except AttributeError:
-                break
-
+        for line in self.__iter_lines():
             # If the line is empty (a blank line) -> Dispatch the event.
             if not line:
                 self.__dispatch(event_type, event_data)
                 event_type, event_data = '', ''
                 continue
 
-            line = (line.decode('utf8')).strip()
             # If the line starts with a U+003A COLON character (:) -> Ignore the line.
             if line.startswith(self.DELIMITER):
                 continue
@@ -240,53 +257,63 @@ class EventSource:
                     # If the field name is "event" -> Set the event type buffer to field value.
                     event_type = value
                 case 'data':
-                    # If the field name is "data" -> Append the field value to the data buffer, then append a single U+000A LINE FEED (LF) character to the data buffer.
+                    # If the field name is "data" -> Append the field value to the data buffer,
+                    # then append a single U+000A LINE FEED (LF) character to the data buffer.
                     event_data += f'{value}\n'
                 case 'id':
-                    # If the field name is "id" -> If the field value does not contain U+0000 NULL, then set the last event ID buffer to the field value. Otherwise, ignore the field.
-                    # The specification is not clear here. In an example it says: "If the "id" field has no value, this will reset the last event ID to the empty string"
+                    # If the field name is "id" -> If the field value does not contain U+0000 NULL,
+                    # then set the last event ID buffer to the field value. Otherwise, ignore the field.
+                    # The specification is not clear here. In an example it says: "If the "id" field
+                    # has no value, this will reset the last event ID to the empty string"
                     self._last_event_id = value
                 case 'retry':
-                    # If the field name is "retry" -> If the field value consists of only ASCII digits, then interpret the field value as an integer in base ten, and set the event stream's reconnection time to that integer. Otherwise, ignore the field.
+                    # If the field name is "retry" -> If the field value consists of only ASCII digits,
+                    # then interpret the field value as an integer in base ten, and set the event stream's
+                    # reconnection time to that integer. Otherwise, ignore the field.
                     if value.isdigit():
                         self._reconnection_time = int(value)
                 case _:
                     # Otherwise -> The field is ignored.
                     continue
 
-    def __reestablish(self) -> None:
-        """Reestablishes the connection."""
+    def __reconnect(self) -> None:
         if self.state is self.State.CLOSED:
             return
-        
-        _logger.debug(f'{self} - Reestablishing connection')
-        with self._state_lock:
+
+        self.__dispatch('error')
+        with self._slock:
             self._state = self.State.CONNECTING
-        self.__dispatch('error', 'reestablish')
 
         if self._last_event_id:
-            self._requests_kwargs['headers']['Last-Event-ID'] = self._last_event_id
+            self._request_kwargs['headers']['Last-Event-ID'] = self._last_event_id
 
         attempt = 0
-        while True:
-            if self.state is not self.State.CONNECTING:
-                break
+        while self.state is self.State.CONNECTING:
+            if _logger.isEnabledFor(logging.DEBUG):
+                if attempt > 0:
+                    _logger.debug(f'{self} - Reconnecting in {(self._reconnection_time/1000) + ((self._backoff_delay/1000)**attempt)} seconds.')
+                else:
+                    _logger.debug(f'{self} - Reconnecting in {(self._reconnection_time/1000)} seconds.')
 
-            # Wait a delay equal to the reconnection time of the event source.
-            time.sleep(self._reconnection_time/1000)
+            try:
+                # Wait a delay equal to the reconnection time of the event source.
+                self._interrupt.wait(self._reconnection_time/1000)
 
-            # If the previous attempt failed, then use exponential backoff delay
-            # to avoid overloading a potentially already overloaded server.
-            if attempt > 0:
-                time.sleep((self._backoff_delay/1000)**attempt)
+                # If the previous attempt failed, then use exponential backoff delay
+                # to avoid overloading a potentially already overloaded server.
+                if attempt > 0:
+                    self._interrupt.wait((self._backoff_delay/1000)**attempt)
+            except KeyboardInterrupt:
+                _logger.error(f'{self} - KeyboardInterrupt through user!')
+                self.__fail()
+                return
 
-            if self.__connect():
-                self.__announce()
-                break
-
+            self.__connect()
             attempt += 1
 
-    def add_event_listener(self, event_type: str, callback: Callable[[Event], None]):
+        _logger.debug(f'{self} - Reconnected!')
+
+    def add_event_listener(self, event_type: str, callback: Callable[[Event], None]) -> None:
         """Sets up a listener that will be called whenever an event with the specified type is received.
         
         Parameters
@@ -297,45 +324,50 @@ class EventSource:
             The listener itself.
         """
         self._listeners[event_type].append(callback)
-        _logger.debug(f'{self} - Added new event listener: {callback}')
-
-    def open(self) -> None:
-        """Opens the event source stream."""
-        _logger.debug(f'{self} - Opening connection')
-        if not self.__connect():
-            self.__reestablish()
-
-        self.__announce()
-        self.__listen()
+        _logger.debug(f'{self} - Added a new event listener for event_type = "{event_type}": {callback}')
 
     def close(self) -> None:
         """Closes the event source stream."""
-        _logger.debug(f'{self} - Closing connection')
-        with self._state_lock:
+        if self.state is self.State.CLOSED:
+            return
+
+        with self._slock:
             self._state = self.State.CLOSED
-        if self._response:
-            with self._response_lock:
-                self._response.close()
+
+        self._interrupt.set()
+
+        if not self._response:
+            return
+
+        with self._rlock:
+            self._response.close()
+
+        _logger.debug(f'{self} - Closed!')
+
+    def open(self) -> None:
+        """Opens the event source stream."""
+        self.__connect()
+        self.__listen()
 
     # # # # # # # # # #
     # Event Methods
-    def on_open(self, event: Event) -> None:
-        """Fired when a connection to an event source has opened.
+    def on_error(self, event: Event) -> None:
+        """Fires on connection failure.
         
-        Overwrite this function to capture those events.
-        Equivalent to addEventListener('open', lambda event: None).
+        Overwrite this method to capture those events.
+        Equivalent to addEventListener('error', lambda event: None).
 
         Parameters
         ----------
         event : Event
-            The open event of the EventSource.
+            The error event of the EventSource.
         """
         pass
 
     def on_message(self, event: Event) -> None:
-        """Fired when data is received from an event source.
+        """Fires if an event is received.
         
-        Overwrite this function to capture those events.
+        Overwrite this method to capture those events.
         Equivalent to addEventListener('message', lambda event: None).
 
         Parameters
@@ -345,15 +377,15 @@ class EventSource:
         """
         pass
 
-    def on_error(self, event: Event) -> None:
-        """Fired when a connection to an event source failed to open.
+    def on_open(self, event: Event) -> None:
+        """Fires on connection establishment.
         
-        Overwrite this function to capture those events.
-        Equivalent to addEventListener('error', lambda event: None).
+        Overwrite this method to capture those events.
+        Equivalent to addEventListener('open', lambda event: None).
 
         Parameters
         ----------
         event : Event
-            The error event of the EventSource.
+            The open event of the EventSource.
         """
         pass
