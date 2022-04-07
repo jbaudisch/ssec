@@ -81,6 +81,13 @@ class EventSource:
         requests_kwargs : Dict[str, Any]    
             Additional arguments for the underlying request like headers, verify etc.
             The stream argument is always set to True and will be ignored if set by user.
+
+        Notes
+        -----
+        In case the event stream is discontinuous, the algorithm will block until a new
+        event arrives. There is no way to interact with the object in the blocking state.
+        Program shutdowns and other checks are not possible at that time. To prevent this,
+        setting a timeout value to the requests_kwargs is the right choice.
         """
         if not is_valid_url(url):
             raise SyntaxError(f'The URL string "{url}" did not match the expected pattern.')
