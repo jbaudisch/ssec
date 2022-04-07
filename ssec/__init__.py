@@ -49,7 +49,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class Event:
     type: str = ''
     data: str = ''
-    id: str = ''
 
 
 class EventSource:
