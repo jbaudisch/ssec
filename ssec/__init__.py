@@ -63,7 +63,7 @@ class EventSource:
     DELIMITER = ':'
 
     def __init__(self, url: str, reconnection_time: int = 3000, backoff_delay: int = 3000, chunk_size: int = 1,
-                 session: Optional[requests.Session] = None, **request_kwargs: Dict[str, Any]) -> None:
+                 session: Optional[requests.Session] = None, **request_kwargs: Any) -> None:
         """
         Parameters
         ----------
